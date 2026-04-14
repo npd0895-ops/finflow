@@ -1962,7 +1962,10 @@ function save() {
   DB.budgets       = stamp(DB.budgets);
   DB.reminders     = stamp(DB.reminders);
   try { localStorage.setItem('finflow_v2', JSON.stringify(DB)); } catch(e) {}
-  if(DB.autoSync && DB.gsUrl) autoSyncPush();
+  if(DB.autoSync && DB.gsUrl) {
+    console.log('[FinFlow] save() → autoSyncPush triggered, autoSync:', DB.autoSync, 'gsUrl:', !!DB.gsUrl);
+    autoSyncPush();
+  }
 }
 function load() {
   try {
@@ -2044,32 +2047,45 @@ async function autoSyncPush() {
 async function _doPush() {
   try {
     setGsDot('syncing', 'Đang đồng bộ...');
-    // Gắn timestamp trước khi push
     const payload = {...DB, lastSyncTime: new Date().toISOString()};
+    // Apps Script yêu cầu no-cors hoặc follow redirect
+    // Dùng 'no-cors' để tránh bị block, nhưng không đọc được response
+    // → dùng cách khác: gửi qua URL params (GET) cho push nhỏ, POST cho push đầy đủ
     const resp = await fetch(DB.gsUrl, {
       method: 'POST',
-      headers: {'Content-Type':'application/json'},
+      headers: {'Content-Type':'text/plain'}, // text/plain tránh preflight CORS
       body: JSON.stringify({action:'save', data: payload})
     });
+    // Apps Script có thể trả về redirect 302 trước khi có response thật
     const txt = await resp.text();
-    if(txt && txt.toLowerCase().includes('ok')) {
+    console.log('[FinFlow Sync] Push response:', txt.slice(0,100));
+    // Check linh hoạt hơn — chấp nhận mọi response có 'ok' hoặc 'status'
+    const isOk = txt && (
+      txt.toLowerCase().includes('"ok"') ||
+      txt.toLowerCase().includes("'ok'") ||
+      txt === 'ok' ||
+      txt.includes('"status"') ||
+      resp.ok
+    );
+    if(isOk) {
       DB.lastSyncTime = payload.lastSyncTime;
       try { localStorage.setItem('finflow_v2', JSON.stringify(DB)); } catch(e) {}
       _syncRetry = 0;
       const t = new Date().toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'});
       setGsDot('ok', 'Đồng bộ ' + t);
     } else {
-      throw new Error('Response: ' + txt);
+      console.warn('[FinFlow Sync] Push failed, response:', txt);
+      throw new Error('Push failed: ' + txt.slice(0,80));
     }
   } catch(e) {
+    console.error('[FinFlow Sync] Push error:', e.message);
     _syncRetry++;
     if(_syncRetry < MAX_RETRY) {
-      // Retry sau 5s
       setTimeout(_doPush, 5000);
-      setGsDot('syncing', `Đang thử lại (${_syncRetry}/${MAX_RETRY})...`);
+      setGsDot('syncing', `Thử lại (${_syncRetry}/${MAX_RETRY})...`);
     } else {
       _syncRetry = 0;
-      setGsDot('', 'Đồng bộ thất bại — kiểm tra kết nối');
+      setGsDot('', 'Auto-sync lỗi — thử Đẩy thủ công');
     }
   }
 }
@@ -2157,9 +2173,8 @@ async function _doPushMerged() {
       body: JSON.stringify({action:'save', data: payload})
     });
     const txt = await resp.text();
-    if(txt && txt.toLowerCase().includes('ok')) {
-      // success
-    }
+    const isOk2 = txt && (txt.startsWith('ok') || txt.includes('"ok"') || resp.ok);
+    console.log('[FinFlow Sync] PushMerged response:', txt.slice(0,50), 'ok:', isOk2);
   } catch(e) { /* silent fail — local đã merge rồi */ }
 }
 
@@ -3968,13 +3983,18 @@ function setGsDot(state, txt){
 
 function toggleAutoSync(el) {
   DB.autoSync = el.checked;
-  save();
+  // Lưu trực tiếp không qua save() để tránh vòng lặp
+  try { localStorage.setItem('finflow_v2', JSON.stringify(DB)); } catch(e) {}
   updateAutoSyncUI();
   if(el.checked) {
     toast('Đã bật tự động đồng bộ ⚡');
-    if(DB.gsUrl) autoSyncPull();
+    if(DB.gsUrl) {
+      // Push ngay 1 lần để test
+      setTimeout(()=>_doPush(), 500);
+    }
   } else {
     toast('Đã tắt tự động đồng bộ');
+    clearTimeout(_syncTimer);
   }
 }
 
@@ -3988,100 +4008,75 @@ function updateAutoSyncUI() {
 }
 
 const APPS_SCRIPT_CODE = `// ============================================================
-// FinFlow Auto-Sync — Google Apps Script v2.0
+// FinFlow Auto-Sync — Google Apps Script v3.0
 // Dán toàn bộ code này vào Apps Script Editor
+// KHÔNG cần thay đổi gì, chỉ cần Save và Deploy
 // ============================================================
 
-const SHEET_NAME = 'data'; // Tên tab trong Google Sheets (không đổi)
+const SHEET_NAME = 'data';
 
-// Lấy Sheet tự động theo ID từ URL — không cần điền gì thêm
 function getSheet() {
   return SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
 }
 
-// Cho phép CORS để app có thể gọi API
-function setCorsHeaders(output) {
-  return output
-    .setMimeType(ContentService.MimeType.JSON);
-}
-
-// GET: load dữ liệu hoặc ping
+// GET: ping hoặc load data
 function doGet(e) {
   try {
     const action = (e && e.parameter && e.parameter.action) || 'load';
-
     if (action === 'ping') {
-      return ContentService.createTextOutput(JSON.stringify({status:'ok',ts:new Date().toISOString()}))
-        .setMimeType(ContentService.MimeType.JSON);
+      return ok('pong');
     }
-
     if (action === 'load') {
       const sheet = getSheet();
-      if (!sheet) throw new Error('Sheet "data" không tìm thấy. Hãy tạo tab tên "data".');
+      if (!sheet) return err('Tab "data" không tìm thấy');
       const raw = sheet.getRange(1, 1).getValue();
-      if (!raw || raw === '') {
-        return ContentService.createTextOutput('{}').setMimeType(ContentService.MimeType.JSON);
-      }
-      // Validate JSON trước khi trả về
-      JSON.parse(raw); // throws nếu invalid
-      return ContentService.createTextOutput(raw).setMimeType(ContentService.MimeType.JSON);
+      return ContentService.createTextOutput(raw || '{}')
+        .setMimeType(ContentService.MimeType.TEXT);
     }
-
-    return ContentService.createTextOutput(JSON.stringify({error:'Unknown action'}))
-      .setMimeType(ContentService.MimeType.JSON);
-
-  } catch(err) {
-    return ContentService.createTextOutput(JSON.stringify({error: err.message}))
-      .setMimeType(ContentService.MimeType.JSON);
+  } catch(e) {
+    return err(e.message);
   }
 }
 
-// POST: lưu dữ liệu
+// POST: lưu data — nhận text/plain để tránh CORS preflight
 function doPost(e) {
   try {
-    if (!e || !e.postData || !e.postData.contents) {
-      throw new Error('Không có dữ liệu gửi lên');
-    }
-
+    if (!e || !e.postData) return err('No post data');
     const body = JSON.parse(e.postData.contents);
+    if (body.action !== 'save') return err('Unknown action');
+    if (!body.data) return err('No data field');
 
-    if (body.action === 'save') {
-      if (!body.data) throw new Error('Thiếu trường data');
+    const sheet = getSheet();
+    if (!sheet) return err('Tab "data" không tìm thấy');
 
-      const sheet = getSheet();
-      if (!sheet) throw new Error('Sheet "data" không tìm thấy');
+    const ts = new Date().toISOString();
+    sheet.getRange(1, 1).setValue(JSON.stringify(body.data));
+    sheet.getRange(1, 2).setValue(ts);
+    sheet.getRange(2, 1).setValue('Cập nhật:');
+    sheet.getRange(2, 2).setValue(Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd/MM/yyyy HH:mm:ss'));
 
-      const dataStr = JSON.stringify(body.data);
-      const ts = new Date().toISOString();
-
-      // Lưu JSON vào ô A1, timestamp vào B1
-      sheet.getRange(1, 1).setValue(dataStr);
-      sheet.getRange(1, 2).setValue(ts);
-      // Ghi metadata vào hàng 2 để dễ đọc
-      sheet.getRange(2, 1).setValue('Cập nhật lần cuối:');
-      sheet.getRange(2, 2).setValue(new Date().toLocaleString('vi-VN'));
-
-      return ContentService.createTextOutput(JSON.stringify({status:'ok', ts: ts}))
-        .setMimeType(ContentService.MimeType.JSON);
-    }
-
-    throw new Error('Unknown action: ' + body.action);
-
-  } catch(err) {
-    return ContentService.createTextOutput(JSON.stringify({error: err.message}))
-      .setMimeType(ContentService.MimeType.JSON);
+    return ok(ts);
+  } catch(e) {
+    return err(e.message);
   }
 }
 
-// Hàm test — chạy trong Apps Script để kiểm tra hoạt động
+function ok(msg) {
+  return ContentService.createTextOutput('ok:' + msg)
+    .setMimeType(ContentService.MimeType.TEXT);
+}
+
+function err(msg) {
+  return ContentService.createTextOutput('error:' + msg)
+    .setMimeType(ContentService.MimeType.TEXT);
+}
+
+// Test — chạy để kiểm tra
 function testScript() {
   const sheet = getSheet();
-  if (!sheet) {
-    Logger.log('LỖI: Không tìm thấy tab "data". Hãy tạo tab có tên "data" trong Sheets.');
-    return;
-  }
-  Logger.log('✅ Script hoạt động tốt! Sheet: ' + sheet.getName());
-  Logger.log('Dữ liệu hiện tại: ' + (sheet.getRange(1,1).getValue() ? 'Có dữ liệu' : 'Chưa có dữ liệu'));
+  if (!sheet) { Logger.log('LỖI: Không tìm thấy tab "data"'); return; }
+  Logger.log('OK: Sheet = ' + sheet.getName());
+  Logger.log('Data: ' + (sheet.getRange(1,1).getValue() ? 'Có dữ liệu' : 'Trống'));
 }`;
 
 function copyAppsScript() {
