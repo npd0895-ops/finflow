@@ -1932,6 +1932,286 @@ input[type=number] { -moz-appearance: textfield; }
 <script>
 // ===== DATA =====
 let DB = { accounts:[], transactions:[], budgets:[], reminders:[], channels:[], channelCosts:[], customExpCats:[], customIncCats:[], customChCats:[], savings:[], gsUrl:'', autoSync:false, lastSyncTime:null };
+
+// ============================================================
+// LEDGER SYNC ENGINE v4.0
+// Split Storage | Append-only | Pull-First | Safety-Check
+// ============================================================
+const SYNC = {
+  VERSION: '4.0',
+  DEBOUNCE_MS: 1500,
+  TIMEOUT_MS: 12000,
+  MAX_RETRY: 3,
+  RETRY_DELAY_MS: 5000,
+  POLL_MS: 5 * 60 * 1000,
+
+  // State machine: 'idle' | 'pulling' | 'pushing' | 'error' | 'ok'
+  state: 'idle',
+  _timer: null,
+  _retry: 0,
+  _pullOnStartDone: false,
+  _safetyLock: false, // true khi local trống, chờ pull xác nhận
+
+  // ── Gọi sau mỗi save() ──────────────────────────────────
+  onSave() {
+    if(!DB.autoSync || !DB.gsUrl) return;
+    if(this._safetyLock) {
+      console.warn('[SYNC] Safety lock active — push blocked until pull completes');
+      return;
+    }
+    clearTimeout(this._timer);
+    this._timer = setTimeout(() => this.push(), this.DEBOUNCE_MS);
+  },
+
+  // ── PUSH: ghi từng loại data lên Sheets ─────────────────
+  async push() {
+    if(!DB.autoSync || !DB.gsUrl) return;
+    this._setState('pushing');
+    this._retry = 0;
+    await this._doPush();
+  },
+
+  async _doPush() {
+    try {
+      const ts = new Date().toISOString();
+      // Stamp updatedAt cho record chưa có
+      const stamp = arr => (arr||[]).map(r=>r.updatedAt?r:{...r, updatedAt:ts});
+      const payload = {
+        action: 'ledger_save',
+        ts,
+        config: {
+          accounts:       stamp(DB.accounts),
+          channels:       stamp(DB.channels),
+          budgets:        stamp(DB.budgets),
+          reminders:      stamp(DB.reminders),
+          customExpCats:  DB.customExpCats||[],
+          customIncCats:  DB.customIncCats||[],
+          customChCats:   DB.customChCats||[],
+          gsUrl:          DB.gsUrl,
+          autoSync:       DB.autoSync,
+          lastSyncTime:   ts,
+        },
+        transactions: stamp(DB.transactions),
+        channelCosts: stamp(DB.channelCosts),
+        savings:      stamp(DB.savings),
+      };
+      const resp = await this._fetch(DB.gsUrl, {
+        method: 'POST',
+        headers: {'Content-Type':'text/plain'},
+        body: JSON.stringify(payload),
+      });
+      const txt = await resp.text();
+      console.log('[SYNC] push response:', txt.slice(0,80));
+      if(txt.startsWith('ok')) {
+        DB.lastSyncTime = ts;
+        try { localStorage.setItem('finflow_v2', JSON.stringify(DB)); } catch(e){}
+        this._retry = 0;
+        this._setState('ok');
+      } else {
+        throw new Error('Push failed: ' + txt.slice(0,60));
+      }
+    } catch(e) {
+      console.error('[SYNC] push error:', e.message);
+      this._retry++;
+      if(this._retry < this.MAX_RETRY) {
+        this._setState('pushing', `Thử lại (\${this._retry}/\${this.MAX_RETRY})...`);
+        setTimeout(()=>this._doPush(), this.RETRY_DELAY_MS);
+      } else {
+        this._retry = 0;
+        this._setState('error', 'Push thất bại — kiểm tra mạng');
+      }
+    }
+  },
+
+  // ── PULL: kéo từ Sheets, merge, rồi push kết quả merge ──
+  async pull() {
+    if(!DB.gsUrl) return;
+    this._setState('pulling');
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(()=>ctrl.abort(), this.TIMEOUT_MS);
+      const resp = await fetch(DB.gsUrl+'?action=ledger_load', {signal:ctrl.signal});
+      clearTimeout(t);
+      const txt = await resp.text();
+      console.log('[SYNC] pull raw:', txt.slice(0,120));
+
+      let remote;
+      try { remote = JSON.parse(txt); } catch(e) {
+        throw new Error('Phản hồi không hợp lệ từ Sheets');
+      }
+
+      // Safety check: nếu remote không có gì → Sheets chưa có data
+      const hasRemoteData = remote && remote.config && Array.isArray(remote.config.accounts);
+
+      if(!hasRemoteData) {
+        // Sheets trống → push local lên (lần đầu setup)
+        console.log('[SYNC] Sheets empty → push local');
+        this._safetyLock = false;
+        await this._doPush();
+        return;
+      }
+
+      // Safety check: nếu local trống và Sheets có data → chỉ pull, không push
+      const localIsEmpty = (DB.transactions||[]).length === 0 && (DB.accounts||[]).length === 0;
+      if(localIsEmpty) {
+        this._safetyLock = true; // block auto-push cho đến khi pull xong
+      }
+
+      // MERGE theo từng mảng
+      const merged = this._merge(DB, remote);
+
+      // Nếu local trống → load toàn bộ từ remote (không merge)
+      if(localIsEmpty) {
+        DB = { ...remote.config, transactions: remote.transactions||[], channelCosts: remote.channelCosts||[], savings: remote.savings||[], gsUrl: DB.gsUrl, autoSync: DB.autoSync };
+        this._safetyLock = false;
+        try { localStorage.setItem('finflow_v2', JSON.stringify(DB)); } catch(e){}
+        this._rerender();
+        this._setState('ok', 'Đã tải dữ liệu từ Cloud');
+        toast('✅ Đã tải dữ liệu từ Sheets về thiết bị mới');
+        return;
+      }
+
+      // So sánh: có gì khác không?
+      const changed = JSON.stringify(merged) !== JSON.stringify({
+        transactions: DB.transactions, accounts: DB.accounts,
+        channels: DB.channels, channelCosts: DB.channelCosts,
+        savings: DB.savings, budgets: DB.budgets, reminders: DB.reminders,
+      });
+
+      if(changed) {
+        // Áp dụng merge vào DB
+        DB.transactions = merged.transactions;
+        DB.accounts     = merged.accounts;
+        DB.channels     = merged.channels;
+        DB.channelCosts = merged.channelCosts;
+        DB.savings      = merged.savings;
+        DB.budgets      = merged.budgets;
+        DB.reminders    = merged.reminders;
+        DB.customExpCats = mergeStringArr(DB.customExpCats, remote.config.customExpCats);
+        DB.customIncCats = mergeStringArr(DB.customIncCats, remote.config.customIncCats);
+        DB.customChCats  = mergeStringArr(DB.customChCats,  remote.config.customChCats);
+        DB.lastSyncTime = new Date().toISOString();
+        try { localStorage.setItem('finflow_v2', JSON.stringify(DB)); } catch(e){}
+        // Push kết quả merge lên để thiết bị kia nhận
+        await this._doPush();
+        this._rerender();
+        const newTx = merged.transactions.length - (remote.transactions||[]).length;
+        if(newTx > 0) toast(`✅ Đã merge +\${newTx} giao dịch từ thiết bị khác`);
+      } else {
+        const t = DB.lastSyncTime
+          ? new Date(DB.lastSyncTime).toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'})
+          : '—';
+        this._setState('ok', 'Đồng bộ ' + t);
+      }
+    } catch(e) {
+      console.error('[SYNC] pull error:', e.message);
+      const msg = e.name==='AbortError' ? 'Timeout kết nối' : 'Không kết nối được Sheets';
+      this._setState('error', msg);
+    }
+  },
+
+  // ── Merge engine ─────────────────────────────────────────
+  _merge(local, remote) {
+    return {
+      transactions: mergeByID(local.transactions, remote.transactions),
+      accounts:     mergeByID(local.accounts,     remote.config?.accounts),
+      channels:     mergeByID(local.channels,      remote.config?.channels),
+      channelCosts: mergeByID(local.channelCosts,  remote.channelCosts),
+      savings:      mergeByID(local.savings,        remote.savings),
+      budgets:      mergeByID(local.budgets,        remote.config?.budgets),
+      reminders:    mergeByID(local.reminders,      remote.config?.reminders),
+    };
+  },
+
+  // ── Helpers ──────────────────────────────────────────────
+  _setState(state, msg) {
+    this.state = state;
+    const dotColor = state==='ok'?'var(--green)':state==='pulling'||state==='pushing'?'var(--yellow)':'var(--red)';
+    const dotClass = 'sync-dot' + (state==='ok'?' ok':state==='pulling'||state==='pushing'?' syncing':'');
+    const statusMsg = msg || (state==='ok'?'Đồng bộ ✓':state==='pushing'?'Đang đẩy dữ liệu...':state==='pulling'?'Đang tải dữ liệu...':'Lỗi kết nối');
+
+    // Sidebar dot
+    ['sync-dot','gs-dot'].forEach(id=>{
+      const el=document.getElementById(id);
+      if(el) el.className=dotClass;
+    });
+    ['sync-label','gs-status-txt'].forEach(id=>{
+      const el=document.getElementById(id);
+      if(el) el.textContent=statusMsg;
+    });
+
+    // Last sync time
+    const ls=document.getElementById('gs-last-sync');
+    if(ls && DB.lastSyncTime) {
+      ls.textContent='Lần cuối: '+new Date(DB.lastSyncTime).toLocaleString('vi-VN',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
+    }
+
+    // Floating indicator
+    const sf=document.getElementById('sync-float');
+    const sfDot=document.getElementById('sf-dot');
+    const sfTxt=document.getElementById('sf-txt');
+    if(!sf||!DB.gsUrl||!DB.autoSync){ if(sf){sf.style.opacity='0';sf.style.pointerEvents='none';} return; }
+    sf.style.opacity='1'; sf.style.pointerEvents='auto';
+    if(sfDot){ sfDot.style.background=dotColor; sfDot.style.animation=(state==='pushing'||state==='pulling')?'syncPulse 1s ease infinite':'none'; }
+    if(sfTxt) sfTxt.textContent=statusMsg;
+    if(state==='ok') setTimeout(()=>{if(sf){sf.style.opacity='0';sf.style.pointerEvents='none';}},4000);
+  },
+
+  async _fetch(url, opts) {
+    const ctrl = new AbortController();
+    const t = setTimeout(()=>ctrl.abort(), this.TIMEOUT_MS);
+    try {
+      const r = await fetch(url, {...opts, signal:ctrl.signal});
+      clearTimeout(t);
+      return r;
+    } catch(e) { clearTimeout(t); throw e; }
+  },
+
+  _rerender() {
+    const activePage = document.querySelector('.page.active');
+    if(activePage) {
+      const pageId = activePage.id.replace('page-','');
+      if(pageId && pageId !== 'sync') go(pageId);
+    } else { renderDashboard(); }
+  },
+
+  // ── Khởi động ────────────────────────────────────────────
+  init() {
+    if(!DB.autoSync || !DB.gsUrl) return;
+    // Pull-First khi khởi động
+    setTimeout(()=>this.pull(), 800);
+    // Poll mỗi 5 phút
+    setInterval(()=>{
+      if(DB.autoSync && DB.gsUrl && document.visibilityState==='visible') this.pull();
+    }, this.POLL_MS);
+    // Pull khi focus lại
+    document.addEventListener('visibilitychange',()=>{
+      if(document.visibilityState==='visible' && DB.autoSync && DB.gsUrl) this.pull();
+    });
+  },
+};
+
+// ── Helper functions độc lập ─────────────────────────────────
+function mergeByID(localArr, remoteArr) {
+  const lMap = new Map((localArr||[]).map(r=>[r.id,r]));
+  const rMap = new Map((remoteArr||[]).map(r=>[r.id,r]));
+  const ids  = new Set([...lMap.keys(),...rMap.keys()]);
+  const out  = [];
+  ids.forEach(id=>{
+    const l=lMap.get(id), r=rMap.get(id);
+    if(!l){ out.push(r); return; }
+    if(!r){ out.push(l); return; }
+    const lt=l.updatedAt?new Date(l.updatedAt).getTime():0;
+    const rt=r.updatedAt?new Date(r.updatedAt).getTime():0;
+    out.push(rt>=lt?r:l);
+  });
+  return out.sort((a,b)=>{
+    if(a.date&&b.date) return b.date.localeCompare(a.date);
+    if(a.updatedAt&&b.updatedAt) return b.updatedAt.localeCompare(a.updatedAt);
+    return 0;
+  });
+}
+function mergeStringArr(a,b){ return [...new Set([...(a||[]),...(b||[])])]; }
 let selColor = '#5b6ef5';
 
 const EXP_CATS = ['Quảng cáo / Ads','Vận hành','Hosting & Tools','Giao vận','Nhập hàng','Marketing','Lương & cộng tác viên','Ăn uống','Di chuyển','Mua sắm','Sức khỏe','Giải trí','Tiền điện','Tiền nước','Tiền internet','Tiền gas','Dịch vụ nhà ở','Tiền thuê mặt bằng','Bảo hiểm','Học phí','Khác'];
@@ -1951,33 +2231,31 @@ const CAT_COLORS = {
 
 // ===== STORAGE =====
 function save() {
-  // Gắn updatedAt cho tất cả records chưa có — dùng để merge sau này
   const now = new Date().toISOString();
-  const stamp = arr => (arr||[]).map(r => r.updatedAt ? r : {...r, updatedAt: now});
-  DB.transactions  = stamp(DB.transactions);
-  DB.accounts      = stamp(DB.accounts);
-  DB.channels      = stamp(DB.channels);
-  DB.channelCosts  = stamp(DB.channelCosts);
-  DB.savings       = stamp(DB.savings);
-  DB.budgets       = stamp(DB.budgets);
-  DB.reminders     = stamp(DB.reminders);
+  const stamp = arr => (arr||[]).map(r=>r.updatedAt?r:{...r,updatedAt:now});
+  DB.transactions = stamp(DB.transactions);
+  DB.accounts     = stamp(DB.accounts);
+  DB.channels     = stamp(DB.channels);
+  DB.channelCosts = stamp(DB.channelCosts);
+  DB.savings      = stamp(DB.savings);
+  DB.budgets      = stamp(DB.budgets);
+  DB.reminders    = stamp(DB.reminders);
   try { localStorage.setItem('finflow_v2', JSON.stringify(DB)); } catch(e) {}
-  if(DB.autoSync && DB.gsUrl) {
-    console.log('[FinFlow] save() → autoSyncPush triggered, autoSync:', DB.autoSync, 'gsUrl:', !!DB.gsUrl);
-    autoSyncPush();
-  }
+  SYNC.onSave();
 }
 function load() {
   try {
     const d = localStorage.getItem('finflow_v2');
-    if (d) DB = { ...DB, ...JSON.parse(d) };
+    if(d) DB = {...DB, ...JSON.parse(d)};
   } catch(e) {}
 }
 
-// ============================================================
-// MERGE ENGINE — gộp dữ liệu từ 2 nguồn theo ID, không mất record
-// ============================================================
-function mergeArrays(localArr, remoteArr) {
+// Legacy merge shims (kept for compat)
+function mergeArrays(localArr, remoteArr) { return mergeByID(localArr, remoteArr); }
+function mergeStringArrays(a,b){ return mergeStringArr(a,b); }
+function mergeDB(local,remote){ return SYNC._merge(local,remote); }
+// (old merge body removed — using SYNC._merge)
+function _placeholder_mergeArrays_body() {
   // Tạo map theo id
   const localMap  = new Map((localArr||[]).map(r => [r.id, r]));
   const remoteMap = new Map((remoteArr||[]).map(r => [r.id, r]));
@@ -2029,168 +2307,16 @@ function mergeDB(local, remote) {
   return merged;
 }
 
-// ===== AUTO-SYNC ENGINE =====
-let _syncTimer = null;
-let _syncRetry = 0;
-const MAX_RETRY = 3;
+// ===== SYNC SHIMS (delegate to SYNC object) =====
+function autoSyncPush(){ SYNC.onSave(); }
 
-// PUSH: đẩy lên Sheets (debounce 1.5s, retry tối đa 3 lần)
-async function autoSyncPush() {
-  clearTimeout(_syncTimer);
-  _syncTimer = setTimeout(async () => {
-    if(!DB.autoSync || !DB.gsUrl) return;
-    _syncRetry = 0;
-    await _doPush();
-  }, 1500);
-}
+async function _doPush(){ await SYNC._doPush(); }
 
-async function _doPush() {
-  try {
-    setGsDot('syncing', 'Đang đồng bộ...');
-    const payload = {...DB, lastSyncTime: new Date().toISOString()};
-    // Apps Script yêu cầu no-cors hoặc follow redirect
-    // Dùng 'no-cors' để tránh bị block, nhưng không đọc được response
-    // → dùng cách khác: gửi qua URL params (GET) cho push nhỏ, POST cho push đầy đủ
-    const resp = await fetch(DB.gsUrl, {
-      method: 'POST',
-      headers: {'Content-Type':'text/plain'}, // text/plain tránh preflight CORS
-      body: JSON.stringify({action:'save', data: payload})
-    });
-    // Apps Script có thể trả về redirect 302 trước khi có response thật
-    const txt = await resp.text();
-    console.log('[FinFlow Sync] Push response:', txt.slice(0,100));
-    // Check linh hoạt hơn — chấp nhận mọi response có 'ok' hoặc 'status'
-    const isOk = txt && (
-      txt.toLowerCase().includes('"ok"') ||
-      txt.toLowerCase().includes("'ok'") ||
-      txt === 'ok' ||
-      txt.includes('"status"') ||
-      resp.ok
-    );
-    if(isOk) {
-      DB.lastSyncTime = payload.lastSyncTime;
-      try { localStorage.setItem('finflow_v2', JSON.stringify(DB)); } catch(e) {}
-      _syncRetry = 0;
-      const t = new Date().toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'});
-      setGsDot('ok', 'Đồng bộ ' + t);
-    } else {
-      console.warn('[FinFlow Sync] Push failed, response:', txt);
-      throw new Error('Push failed: ' + txt.slice(0,80));
-    }
-  } catch(e) {
-    console.error('[FinFlow Sync] Push error:', e.message);
-    _syncRetry++;
-    if(_syncRetry < MAX_RETRY) {
-      setTimeout(_doPush, 5000);
-      setGsDot('syncing', `Thử lại (${_syncRetry}/${MAX_RETRY})...`);
-    } else {
-      _syncRetry = 0;
-      setGsDot('', 'Auto-sync lỗi — thử Đẩy thủ công');
-    }
-  }
-}
+async function autoSyncPull(){ await SYNC.pull(); }
+async function _doPushMerged(){ await SYNC._doPush(); }
 
-// PULL + MERGE: kéo từ Sheets về và merge với local
-async function autoSyncPull() {
-  if(!DB.autoSync || !DB.gsUrl) return;
-  try {
-    setGsDot('syncing', 'Đang kiểm tra dữ liệu...');
-    const controller = new AbortController();
-    const timeout = setTimeout(()=>controller.abort(), 10000);
-    const r = await fetch(DB.gsUrl + '?action=load', {signal: controller.signal});
-    clearTimeout(timeout);
-    const json = await r.json();
 
-    if(json && json.accounts) {
-      const localTime  = DB.lastSyncTime  ? new Date(DB.lastSyncTime).getTime()  : 0;
-      const sheetsTime = json.lastSyncTime ? new Date(json.lastSyncTime).getTime() : 0;
-
-      if(sheetsTime === localTime && localTime !== 0) {
-        // Hoàn toàn giống nhau → không cần làm gì
-        setGsDot('ok', 'Đồng bộ ' + new Date(DB.lastSyncTime).toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'}));
-        return;
-      }
-
-      // LUÔN MERGE — bất kể thiết bị nào mới hơn
-      // Đây là điểm cốt lõi: không bao giờ ghi đè, luôn gộp
-      const beforeMerge = {
-        txCount: (DB.transactions||[]).length,
-        accCount: (DB.accounts||[]).length,
-      };
-
-      DB = mergeDB(DB, json);
-
-      const afterMerge = {
-        txCount: (DB.transactions||[]).length,
-        accCount: (DB.accounts||[]).length,
-      };
-
-      try { localStorage.setItem('finflow_v2', JSON.stringify(DB)); } catch(e) {}
-
-      // Push kết quả merge lên Sheets để cả 2 thiết bị có cùng data
-      await _doPushMerged();
-
-      // Re-render trang hiện tại
-      const activePage = document.querySelector('.page.active');
-      if(activePage) {
-        const pageId = activePage.id.replace('page-','');
-        if(pageId && pageId !== 'sync') go(pageId);
-      }
-
-      const newTx  = afterMerge.txCount  - beforeMerge.txCount;
-      const newAcc = afterMerge.accCount - beforeMerge.accCount;
-      const t = new Date(DB.lastSyncTime).toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'});
-      setGsDot('ok', 'Merge ' + t);
-
-      // Chỉ toast nếu thực sự có data mới từ thiết bị khác
-      if(newTx > 0 || newAcc > 0) {
-        const parts = [];
-        if(newTx  > 0) parts.push(`+${newTx} giao dịch`);
-        if(newAcc > 0) parts.push(`+${newAcc} tài khoản`);
-        toast(`✅ Đã merge: ${parts.join(', ')} từ thiết bị khác`);
-      }
-
-    } else {
-      // Sheets chưa có data → push local lên
-      await _doPush();
-    }
-  } catch(e) {
-    if(e.name === 'AbortError') {
-      setGsDot('', 'Timeout — kiểm tra kết nối');
-    } else {
-      setGsDot('', 'Không kết nối được Sheets');
-    }
-  }
-}
-
-// Push kết quả merge (không debounce, push ngay)
-async function _doPushMerged() {
-  try {
-    const payload = {...DB, lastSyncTime: DB.lastSyncTime || new Date().toISOString()};
-    const resp = await fetch(DB.gsUrl, {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({action:'save', data: payload})
-    });
-    const txt = await resp.text();
-    const isOk2 = txt && (txt.startsWith('ok') || txt.includes('"ok"') || resp.ok);
-    console.log('[FinFlow Sync] PushMerged response:', txt.slice(0,50), 'ok:', isOk2);
-  } catch(e) { /* silent fail — local đã merge rồi */ }
-}
-
-// Periodic sync mỗi 5 phút khi app đang mở
-setInterval(()=>{
-  if(DB.autoSync && DB.gsUrl && document.visibilityState === 'visible') {
-    autoSyncPull();
-  }
-}, 5 * 60 * 1000);
-
-// Sync khi tab được focus lại
-document.addEventListener('visibilitychange', ()=>{
-  if(document.visibilityState === 'visible' && DB.autoSync && DB.gsUrl) {
-    autoSyncPull();
-  }
-});
+// Periodic sync handled by SYNC.init()
 
 // ===== UTILS =====
 function uid() { return Date.now().toString(36)+Math.random().toString(36).slice(2,6); }
@@ -3931,6 +4057,9 @@ async function loadFromSheets(){
 }
 
 function setGsDot(state, txt){
+  SYNC._setState(state==='ok'?'ok':state==='syncing'?'pushing':'error', txt);
+}
+function _setGsDotDirect(state, txt){
   // state: 'ok' | 'syncing' | '' (error) | 'disabled'
   const dotColor  = state==='ok'?'#10d9a0':state==='syncing'?'#f5c842':'#f4607a';
   const dotClass  = 'sync-dot'+(state?' '+state:'');
@@ -3983,18 +4112,18 @@ function setGsDot(state, txt){
 
 function toggleAutoSync(el) {
   DB.autoSync = el.checked;
-  // Lưu trực tiếp không qua save() để tránh vòng lặp
   try { localStorage.setItem('finflow_v2', JSON.stringify(DB)); } catch(e) {}
   updateAutoSyncUI();
   if(el.checked) {
     toast('Đã bật tự động đồng bộ ⚡');
     if(DB.gsUrl) {
-      // Push ngay 1 lần để test
-      setTimeout(()=>_doPush(), 500);
+      SYNC._safetyLock = false;
+      setTimeout(()=>SYNC.pull(), 300); // Pull-First ngay khi bật
     }
   } else {
     toast('Đã tắt tự động đồng bộ');
-    clearTimeout(_syncTimer);
+    clearTimeout(SYNC._timer);
+    SYNC._setState('idle','Auto-sync đã tắt');
   }
 }
 
@@ -4008,75 +4137,193 @@ function updateAutoSyncUI() {
 }
 
 const APPS_SCRIPT_CODE = `// ============================================================
-// FinFlow Auto-Sync — Google Apps Script v3.0
-// Dán toàn bộ code này vào Apps Script Editor
-// KHÔNG cần thay đổi gì, chỉ cần Save và Deploy
+// FinFlow Ledger Sync — Google Apps Script v4.0
+// Split Storage: Tab 'config' + Tab 'transactions' + Tab 'channelcosts' + Tab 'savings'
+// KHÔNG cần chỉnh sửa — chỉ Save và Deploy as Web App
 // ============================================================
 
-const SHEET_NAME = 'data';
+// ── Tab names ──────────────────────────────────────────────
+const T_CONFIG  = 'config';
+const T_TX      = 'transactions';
+const T_COST    = 'channelcosts';
+const T_SAVING  = 'savings';
 
-function getSheet() {
-  return SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+// ── Helpers ────────────────────────────────────────────────
+function ss() { return SpreadsheetApp.getActiveSpreadsheet(); }
+
+function getOrCreateTab(name) {
+  let sheet = ss().getSheetByName(name);
+  if (!sheet) {
+    sheet = ss().insertSheet(name);
+    Logger.log('Created tab: ' + name);
+  }
+  return sheet;
 }
 
-// GET: ping hoặc load data
+function textOut(txt) {
+  return ContentService.createTextOutput(txt)
+    .setMimeType(ContentService.MimeType.TEXT);
+}
+
+function ok(msg) { return textOut('ok:' + (msg||'done')); }
+function err(msg) { Logger.log('ERR: '+msg); return textOut('error:' + msg); }
+
+// ── Đọc toàn bộ dữ liệu ───────────────────────────────────
 function doGet(e) {
   try {
-    const action = (e && e.parameter && e.parameter.action) || 'load';
+    const action = (e && e.parameter && e.parameter.action) || 'ledger_load';
+
     if (action === 'ping') {
-      return ok('pong');
+      return ok('pong:' + new Date().toISOString());
     }
-    if (action === 'load') {
-      const sheet = getSheet();
-      if (!sheet) return err('Tab "data" không tìm thấy');
-      const raw = sheet.getRange(1, 1).getValue();
-      return ContentService.createTextOutput(raw || '{}')
-        .setMimeType(ContentService.MimeType.TEXT);
+
+    if (action === 'ledger_load') {
+      // Đọc config (JSON đơn từ ô A1)
+      const cfgSheet = ss().getSheetByName(T_CONFIG);
+      const cfgRaw   = cfgSheet ? cfgSheet.getRange(1,1).getValue() : '{}';
+      let config = {};
+      try { config = JSON.parse(cfgRaw || '{}'); } catch(e) {}
+
+      // Đọc từng sheet giao dịch
+      const transactions = readRows(T_TX);
+      const channelCosts = readRows(T_COST);
+      const savings      = readRows(T_SAVING);
+
+      const result = JSON.stringify({ config, transactions, channelCosts, savings });
+      return textOut(result).setMimeType(ContentService.MimeType.TEXT);
     }
+
+    return err('Unknown action: ' + action);
   } catch(e) {
     return err(e.message);
   }
 }
 
-// POST: lưu data — nhận text/plain để tránh CORS preflight
+// ── Ghi dữ liệu ───────────────────────────────────────────
 function doPost(e) {
   try {
     if (!e || !e.postData) return err('No post data');
     const body = JSON.parse(e.postData.contents);
-    if (body.action !== 'save') return err('Unknown action');
-    if (!body.data) return err('No data field');
 
-    const sheet = getSheet();
-    if (!sheet) return err('Tab "data" không tìm thấy');
+    if (body.action === 'ledger_save') {
+      const ts = body.ts || new Date().toISOString();
 
-    const ts = new Date().toISOString();
-    sheet.getRange(1, 1).setValue(JSON.stringify(body.data));
-    sheet.getRange(1, 2).setValue(ts);
-    sheet.getRange(2, 1).setValue('Cập nhật:');
-    sheet.getRange(2, 2).setValue(Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd/MM/yyyy HH:mm:ss'));
+      // 1. Ghi config (overwrite A1 — config không cần append)
+      const cfgSheet = getOrCreateTab(T_CONFIG);
+      cfgSheet.getRange(1,1).setValue(JSON.stringify(body.config || {}));
+      cfgSheet.getRange(1,2).setValue(ts);
+      cfgSheet.getRange(2,1).setValue('Cập nhật:');
+      cfgSheet.getRange(2,2).setValue(Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd/MM/yyyy HH:mm:ss'));
 
-    return ok(ts);
+      // 2. Ghi transactions theo ID (upsert)
+      upsertRows(T_TX, body.transactions || []);
+
+      // 3. Ghi channelCosts theo ID
+      upsertRows(T_COST, body.channelCosts || []);
+
+      // 4. Ghi savings theo ID
+      upsertRows(T_SAVING, body.savings || []);
+
+      return ok(ts);
+    }
+
+    return err('Unknown action: ' + body.action);
   } catch(e) {
     return err(e.message);
   }
 }
 
-function ok(msg) {
-  return ContentService.createTextOutput('ok:' + msg)
-    .setMimeType(ContentService.MimeType.TEXT);
+// ── Đọc tất cả rows từ một tab → array of objects ─────────
+function readRows(tabName) {
+  const sheet = ss().getSheetByName(tabName);
+  if (!sheet) return [];
+  const data = sheet.getDataRange().getValues();
+  if (data.length < 2) return []; // chỉ có header hoặc trống
+  const headers = data[0];
+  return data.slice(1).map(row => {
+    const obj = {};
+    headers.forEach((h, i) => { if (h) obj[h] = row[i]; });
+    return obj;
+  }).filter(r => r.id); // bỏ row trống
 }
 
-function err(msg) {
-  return ContentService.createTextOutput('error:' + msg)
-    .setMimeType(ContentService.MimeType.TEXT);
+// ── Upsert rows: thêm mới nếu chưa có ID, cập nhật nếu đã có ──
+function upsertRows(tabName, records) {
+  if (!records || records.length === 0) return;
+  const sheet = getOrCreateTab(tabName);
+
+  // Lấy tất cả columns từ data (union tất cả keys)
+  const allKeys = [...new Set(records.flatMap(r => Object.keys(r)))];
+  // Cột bắt buộc đứng đầu
+  const priorityCols = ['id','date','updatedAt'];
+  const headers = [
+    ...priorityCols.filter(c => allKeys.includes(c)),
+    ...allKeys.filter(c => !priorityCols.includes(c))
+  ];
+
+  // Kiểm tra header hiện tại
+  const existingData = sheet.getDataRange().getValues();
+  let existingHeaders = [];
+  let idColIndex = -1;
+  const existingIDMap = new Map(); // id → row number (1-based)
+
+  if (existingData.length > 0 && existingData[0][0]) {
+    existingHeaders = existingData[0];
+    idColIndex = existingHeaders.indexOf('id');
+    // Map ID → row index
+    for (let i = 1; i < existingData.length; i++) {
+      const rowId = existingData[i][idColIndex];
+      if (rowId) existingIDMap.set(String(rowId), i + 1); // 1-based row
+    }
+  }
+
+  // Nếu sheet mới hoặc header khác → ghi lại toàn bộ (migration)
+  if (existingHeaders.length === 0) {
+    // Sheet mới: ghi header rồi append tất cả
+    sheet.appendRow(headers);
+    records.forEach(r => {
+      sheet.appendRow(headers.map(h => {
+        const v = r[h];
+        return v === undefined ? '' : (typeof v === 'object' ? JSON.stringify(v) : v);
+      }));
+    });
+    return;
+  }
+
+  // Sheet đã có data: upsert từng record
+  records.forEach(record => {
+    const id = String(record.id || '');
+    if (!id) return;
+
+    // Xây dựng row theo header hiện tại của sheet
+    const row = existingHeaders.map(h => {
+      const v = record[h];
+      if (v === undefined) return '';
+      if (typeof v === 'object') return JSON.stringify(v);
+      return v;
+    });
+
+    if (existingIDMap.has(id)) {
+      // UPDATE: ghi đè row cũ
+      const rowNum = existingIDMap.get(id);
+      sheet.getRange(rowNum, 1, 1, row.length).setValues([row]);
+    } else {
+      // INSERT: append row mới
+      sheet.appendRow(row);
+      existingIDMap.set(id, existingData.length + existingIDMap.size + 1);
+    }
+  });
 }
 
-// Test — chạy để kiểm tra
+// ── Test ──────────────────────────────────────────────────
 function testScript() {
-  const sheet = getSheet();
-  if (!sheet) { Logger.log('LỖI: Không tìm thấy tab "data"'); return; }
-  Logger.log('OK: Sheet = ' + sheet.getName());
-  Logger.log('Data: ' + (sheet.getRange(1,1).getValue() ? 'Có dữ liệu' : 'Trống'));
+  Logger.log('=== FinFlow Ledger Sync v4.0 Test ===');
+  [T_CONFIG, T_TX, T_COST, T_SAVING].forEach(name => {
+    const s = ss().getSheetByName(name);
+    Logger.log((s ? '✅' : '⚠️ (sẽ tự tạo khi sync)') + ' Tab: ' + name);
+  });
+  Logger.log('Script URL: ' + ScriptApp.getService().getUrl());
+  Logger.log('Test OK!');
 }`;
 
 function copyAppsScript() {
