@@ -2002,7 +2002,9 @@ const SYNC = {
       });
       const txt = await resp.text();
       console.log('[SYNC] push response:', txt.slice(0,80));
-      if(txt.startsWith('ok')) {
+      // Chấp nhận: 'ok:...', 'ok', hoặc JSON có status ok
+      const pushOk = txt.startsWith('ok') || (()=>{try{const j=JSON.parse(txt);return j.status==='ok'||j.ok;}catch(e){return false;}})();
+      if(pushOk) {
         DB.lastSyncTime = ts;
         try { localStorage.setItem('finflow_v2', JSON.stringify(DB)); } catch(e){}
         this._retry = 0;
@@ -2024,8 +2026,13 @@ const SYNC = {
   },
 
   // ── PULL: kéo từ Sheets, merge, rồi push kết quả merge ──
-  async pull() {
-    if(!DB.gsUrl) return;
+  async pull(force=false) {
+    // Nếu đang pulling thì bỏ qua (tránh concurrent requests)
+    if(this.state === 'pulling' && !force) return;
+    if(!DB.gsUrl) {
+      this._setState('idle', 'Chưa cấu hình URL');
+      return;
+    }
     this._setState('pulling');
     try {
       const ctrl = new AbortController();
@@ -2035,10 +2042,17 @@ const SYNC = {
       const txt = await resp.text();
       console.log('[SYNC] pull raw:', txt.slice(0,120));
 
+      // Sheets v4 trả text/plain — parse linh hoạt
       let remote;
-      try { remote = JSON.parse(txt); } catch(e) {
-        throw new Error('Phản hồi không hợp lệ từ Sheets');
+      try {
+        remote = JSON.parse(txt);
+      } catch(e) {
+        // Có thể là lỗi text
+        if(txt.startsWith('error:')) throw new Error(txt.slice(6));
+        throw new Error('Phản hồi không hợp lệ: ' + txt.slice(0,80));
       }
+      // Nếu response là object có error field
+      if(remote && remote.error) throw new Error(remote.error);
 
       // Safety check: nếu remote không có gì → Sheets chưa có data
       const hasRemoteData = remote && remote.config && Array.isArray(remote.config.accounts);
@@ -2177,16 +2191,38 @@ const SYNC = {
 
   // ── Khởi động ────────────────────────────────────────────
   init() {
-    if(!DB.autoSync || !DB.gsUrl) return;
-    // Pull-First khi khởi động
-    setTimeout(()=>this.pull(), 800);
+    // Pull-First: chạy ngay khi mở app nếu đã cấu hình
+    if(DB.autoSync && DB.gsUrl) {
+      setTimeout(()=>this.pull(), 1000);
+    }
     // Poll mỗi 5 phút
     setInterval(()=>{
-      if(DB.autoSync && DB.gsUrl && document.visibilityState==='visible') this.pull();
+      if(DB.autoSync && DB.gsUrl && document.visibilityState==='visible') {
+        this.pull();
+      }
     }, this.POLL_MS);
-    // Pull khi focus lại
+    // Pull khi tab được focus lại (chuyển thiết bị / tab)
     document.addEventListener('visibilitychange',()=>{
-      if(document.visibilityState==='visible' && DB.autoSync && DB.gsUrl) this.pull();
+      if(document.visibilityState==='visible' && DB.autoSync && DB.gsUrl) {
+        // Delay nhỏ để tránh race condition
+        setTimeout(()=>this.pull(), 300);
+      }
+    });
+    // Pull khi window focus (chuyển app trên mobile)
+    window.addEventListener('focus', ()=>{
+      if(DB.autoSync && DB.gsUrl) {
+        setTimeout(()=>this.pull(), 300);
+      }
+    });
+    // Pull khi online lại sau khi mất mạng
+    window.addEventListener('online', ()=>{
+      if(DB.autoSync && DB.gsUrl) {
+        this._setState('pulling', 'Đã có mạng — đang đồng bộ...');
+        setTimeout(()=>this.pull(true), 500);
+      }
+    });
+    window.addEventListener('offline', ()=>{
+      this._setState('error', 'Mất kết nối mạng');
     });
   },
 };
@@ -2765,7 +2801,7 @@ function saveTx() {
     accountId: accId,
     accountToId: type==='transfer'?accToId:null,
     category: type==='transfer'?'Chuyển khoản nội bộ':document.getElementById('tx-cat').value,
-    channelId: document.getElementById('tx-ch').value||null,
+    channelId: (type==='income' && document.getElementById('tx-ch-wrap')?.style.display!=='none') ? (document.getElementById('tx-ch').value||null) : null,
     desc: document.getElementById('tx-desc').value.trim(),
     note: document.getElementById('tx-note').value.trim()
   };
@@ -3092,7 +3128,10 @@ function renderDashboard() {
   }
   // Channel bars
   const chMap={};
-  mtx.filter(t=>t.type==='income'&&t.channelId).forEach(t=>chMap[t.channelId]=(chMap[t.channelId]||0)+t.amount);
+  // Chỉ tính income có channelId hợp lệ (tồn tại trong DB.channels)
+  const validChIds = new Set((DB.channels||[]).map(c=>c.id));
+  mtx.filter(t=>t.type==='income' && t.channelId && validChIds.has(t.channelId))
+     .forEach(t=>chMap[t.channelId]=(chMap[t.channelId]||0)+t.amount);
   const chb=document.getElementById('d-ch-bars');
   if(!Object.keys(chMap).length){
     chb.innerHTML='<div class="empty"><div class="empty-ico">🔗</div><div class="empty-txt">Chưa có dữ liệu kênh</div></div>';
@@ -3102,7 +3141,8 @@ function renderDashboard() {
     chb.innerHTML='<div class="bars">'+Object.entries(chMap).sort((a,b)=>b[1]-a[1]).map(([id,v],i)=>{
       const ch=DB.channels.find(c=>c.id===id);
       const col=colors[i%colors.length];
-      return `<div class="bar-row"><div class="bar-lbl">${ch?ch.name:id}</div>
+      if(!ch) return ''; // bỏ qua channel không tồn tại
+      return `<div class="bar-row"><div class="bar-lbl">${ch.name}</div>
         <div class="bar-track"><div class="bar-fill" style="width:${(v/mx*100).toFixed(1)}%;background:${col}"></div></div>
         <div class="bar-val" style="color:${col}">${fmt(v)}</div></div>`;
     }).join('')+'</div>';
@@ -4034,27 +4074,32 @@ async function testSheets(){
 }
 
 async function saveToSheets(){
-  const url=DB.gsUrl||document.getElementById('gs-url').value.trim();
-  if(!url){toast('Chưa có URL Sheets!','var(--red)');return;}
-  setGsDot('syncing','Đang đồng bộ...');
-  try {
-    await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({action:'save',data:DB})});
-    setGsDot('ok','Đồng bộ thành công — '+new Date().toLocaleTimeString('vi-VN'));
-    toast('Đã đẩy dữ liệu lên Google Sheets!');
-  } catch(e){ setGsDot('','Lỗi đồng bộ'); toast('Lỗi — kiểm tra kết nối internet','var(--red)'); }
+  const urlEl = document.getElementById('gs-url');
+  const url = (urlEl && urlEl.value.trim()) || DB.gsUrl;
+  if(!url){ toast('Chưa nhập URL Sheets!','var(--red)'); return; }
+  if(url !== DB.gsUrl){
+    DB.gsUrl = url;
+    try{localStorage.setItem('finflow_v2',JSON.stringify(DB));}catch(e){}
+  }
+  toast('⏳ Đang đẩy dữ liệu lên Sheets...');
+  await SYNC.push();
+  if(SYNC.state==='ok') toast('✅ Đã đẩy xong!');
 }
 
 async function loadFromSheets(){
-  const url=DB.gsUrl||document.getElementById('gs-url').value.trim();
-  if(!url){toast('Chưa có URL Sheets!','var(--red)');return;}
-  setGsDot('syncing','Đang tải...');
-  try {
-    const r=await fetch(url+'?action=load');
-    const json=await r.json();
-    if(json&&json.accounts){ DB={...json,gsUrl:url}; save(); renderDashboard(); setGsDot('ok','Tải thành công — '+new Date().toLocaleTimeString('vi-VN')); toast('Đã tải dữ liệu từ Google Sheets!'); }
-    else throw new Error();
-  } catch(e){ setGsDot('','Lỗi tải dữ liệu'); toast('Lỗi tải dữ liệu','var(--red)'); }
+  const urlEl = document.getElementById('gs-url');
+  const url = (urlEl && urlEl.value.trim()) || DB.gsUrl;
+  if(!url){ toast('Chưa nhập URL Sheets!','var(--red)'); return; }
+  if(url !== DB.gsUrl){
+    DB.gsUrl = url;
+    try{localStorage.setItem('finflow_v2',JSON.stringify(DB));}catch(e){}
+  }
+  toast('⏳ Đang tải dữ liệu từ Sheets...');
+  await SYNC.pull(true);
+  if(SYNC.state==='ok') toast('✅ Đã tải xong!');
 }
+
+
 
 function setGsDot(state, txt){
   SYNC._setState(state==='ok'?'ok':state==='syncing'?'pushing':'error', txt);
